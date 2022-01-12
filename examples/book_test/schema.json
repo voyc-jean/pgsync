@@ -1,0 +1,39 @@
+[
+    {
+        "database": "book",
+        "index": "book",
+        "nodes": {
+            "table": "book",
+            "columns": [
+                "id",
+                "title",
+                "description"
+            ],
+            "children": [
+                {
+                    "table": "paragraph",
+                    "columns": [
+                        "id"
+                    ],
+                    "children": [
+                        {
+                            "table": "sentence",
+                            "columns": [
+                                "id",
+                                "text"
+                            ],
+                            "relationship": {
+                                "variant": "object",
+                                "type": "one_to_many"
+                            }
+                        }
+                    ],
+                    "relationship": {
+                        "variant": "object",
+                        "type": "one_to_many"
+                    }
+                }
+            ]
+        }
+    }
+]
