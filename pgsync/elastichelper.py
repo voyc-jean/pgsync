@@ -271,7 +271,7 @@ class ElasticHelper(object):
             rename: dict = node.transform.get("rename", {})
             mapping: dict = node.transform.get("mapping", {})
 
-            for key, value in mapping.items():
+            for key in mapping.keys():
                 column: str = rename.get(key, key)
                 column_type: str = mapping[column]["type"]
                 if column_type not in ELASTICSEARCH_TYPES:
@@ -281,7 +281,12 @@ class ElasticHelper(object):
 
                 if "properties" not in node._mapping:
                     node._mapping["properties"] = {}
-                node._mapping["properties"][column] = {"type": column_type}
+
+                if column_type in ["nested"] and column in node._mapping["properties"]:
+                    node._mapping["properties"][column]["properties"] = node._mapping["properties"][column]["properties"]
+                    node._mapping["properties"][column]["type"] = column_type
+                else:
+                    node._mapping["properties"][column] = {"type": column_type}
 
                 for parameter, parameter_value in mapping[column].items():
                     if parameter == "type":
