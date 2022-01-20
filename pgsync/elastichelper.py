@@ -282,11 +282,12 @@ class ElasticHelper(object):
                 if "properties" not in node._mapping:
                     node._mapping["properties"] = {}
 
-                if column_type in ["nested"] and column in node._mapping["properties"]:
-                    node._mapping["properties"][column]["properties"] = node._mapping["properties"][column]["properties"]
-                    node._mapping["properties"][column]["type"] = column_type
+                properties = node._mapping["properties"]
+
+                if column_type in ["nested"] and column in properties:
+                    properties[column]["type"] = column_type
                 else:
-                    node._mapping["properties"][column] = {"type": column_type}
+                    properties[column] = {"type": column_type}
 
                 for parameter, parameter_value in mapping[column].items():
                     if parameter == "type":
