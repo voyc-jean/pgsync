@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-"""Main module."""
+"""Sync module."""
 import json
 import logging
 import os
@@ -10,16 +10,16 @@ import select
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
 from typing import AnyStr, Generator, List, Optional, Set
 
 import click
 import sqlalchemy as sa
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from sqlalchemy.sql import Values
 
 from . import __version__
-from .base import Base, compiled_query, get_foreign_keys
+from .base import Base, compiled_query, get_foreign_keys, TupleIdentifierType
 from .constants import (
     DELETE,
     INSERT,
@@ -53,6 +53,7 @@ from .settings import (
     LOG_INTERVAL,
     POLL_TIMEOUT,
     REDIS_POLL_INTERVAL,
+    REDIS_WRITE_CHUNK_SIZE,
     REPLICATION_SLOT_CLEANUP_INTERVAL,
 )
 from .transform import get_private_keys, transform
@@ -95,7 +96,6 @@ class Sync(Base):
         )
         self.redis: RedisQueue = RedisQueue(self.__name)
         self.tree: Tree = Tree(self)
-        self._last_truncate_timestamp: datetime = datetime.now()
         if validate:
             self.validate(repl_slots=repl_slots)
             self.create_setting()
@@ -184,12 +184,12 @@ class Sync(Base):
             if node.is_root:
                 continue
 
-            primary_keys = [
+            primary_keys: list = [
                 str(primary_key.name) for primary_key in node.primary_keys
             ]
 
             if node.relationship.through_tables:
-                through_table = node.relationship.through_tables[0]
+                through_table: str = node.relationship.through_tables[0]
                 through: Node = node_from_table(
                     self,
                     through_table,
@@ -277,7 +277,6 @@ class Sync(Base):
 
     def teardown(self, drop_view: bool = True) -> None:
         """Drop the database triggers and replication slot."""
-
         try:
             os.unlink(self._checkpoint_file)
         except OSError:
@@ -807,7 +806,7 @@ class Sync(Base):
             for _filter in filters.get(node.table):
                 where: list = []
                 for key, value in _filter.items():
-                    where.append(getattr(node.model.c, key) == value)
+                    where.append(node.model.c[key] == value)
                     keys.add(key)
                     values.add(value)
                 _filters.append(sa.and_(*where))
@@ -820,6 +819,7 @@ class Sync(Base):
         txmin: Optional[int] = None,
         txmax: Optional[int] = None,
         extra: Optional[dict] = None,
+        ctid: Optional[int] = None,
     ) -> Generator:
         if filters is None:
             filters: dict = {}
@@ -833,6 +833,41 @@ class Sync(Base):
             self._build_filters(filters, node)
 
             if node.is_root:
+
+                if ctid is not None:
+                    subquery = []
+                    for page, rows in ctid.items():
+                        subquery.append(
+                            sa.select(
+                                [
+                                    sa.cast(
+                                        sa.literal_column(f"'({page},'")
+                                        .concat(sa.column("s"))
+                                        .concat(")"),
+                                        TupleIdentifierType,
+                                    )
+                                ]
+                            ).select_from(
+                                Values(
+                                    sa.column("s"),
+                                )
+                                .data([(row,) for row in rows])
+                                .alias("s")
+                            )
+                        )
+                    if subquery:
+                        node._filters.append(
+                            sa.or_(
+                                *[
+                                    node.model.c.ctid
+                                    == sa.any_(
+                                        sa.func.ARRAY(q.scalar_subquery())
+                                    )
+                                    for q in subquery
+                                ]
+                            )
+                        )
+
                 if txmin:
                     node._filters.append(
                         sa.cast(
@@ -957,10 +992,15 @@ class Sync(Base):
         channel: str = self.database
         cursor.execute(f'LISTEN "{channel}"')
         logger.debug(f'Listening for notifications on channel "{channel}"')
+        items: list = []
 
         while True:
             # NB: consider reducing POLL_TIMEOUT to increase throughout
             if select.select([conn], [], [], POLL_TIMEOUT) == ([], [], []):
+                # Catch any hanging items from the last poll
+                if items:
+                    self.redis.bulk_push(items)
+                    items = []
                 continue
 
             try:
@@ -970,10 +1010,13 @@ class Sync(Base):
                 os._exit(-1)
 
             while conn.notifies:
+                if len(items) >= REDIS_WRITE_CHUNK_SIZE:
+                    self.redis.bulk_push(items)
+                    items = []
                 notification: AnyStr = conn.notifies.pop(0)
                 if notification.channel == channel:
                     payload = json.loads(notification.payload)
-                    self.redis.push(payload)
+                    items.append(payload)
                     logger.debug(f"on_notify: {payload}")
                     self.count["db"] += 1
 
@@ -1027,7 +1070,7 @@ class Sync(Base):
         """Pull data from db."""
         txmin: int = self.checkpoint
         txmax: int = self.txid_current
-        logger.debug(f"pull txmin: {txmin} txmax: {txmax}")
+        logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
         # forward pass sync
         self.es.bulk(self.index, self.sync(txmin=txmin, txmax=txmax))
         self.checkpoint: int = txmax or self.txid_current
@@ -1039,15 +1082,10 @@ class Sync(Base):
     def truncate_slots(self) -> None:
         """Truncate the logical replication slot."""
         while True:
-            if self._truncate and (
-                datetime.now()
-                >= self._last_truncate_timestamp
-                + timedelta(seconds=REPLICATION_SLOT_CLEANUP_INTERVAL)
-            ):
+            if self._truncate:
                 logger.debug(f"Truncating replication slot: {self.__name}")
                 self.logical_slot_get_changes(self.__name, upto_nchanges=None)
-                self._last_truncate_timestamp = datetime.now()
-            time.sleep(0.1)
+            time.sleep(REPLICATION_SLOT_CLEANUP_INTERVAL)
 
     @threaded
     def status(self):
@@ -1057,7 +1095,7 @@ class Sync(Base):
                 f"Xlog: [{self.count['xlog']:,}] => "
                 f"Db: [{self.count['db']:,}] => "
                 f"Redis: [total = {self.count['redis']:,} "
-                f"pending = {self.redis.qsize():,}] => "
+                f"pending = {self.redis.qsize:,}] => "
                 f"Elastic: [{self.es.doc_count:,}] ...\n"
             )
             sys.stdout.flush()
@@ -1156,9 +1194,7 @@ def main(
     version,
     analyze,
 ):
-    """
-    main application syncer
-    """
+    """Main application syncer."""
     if version:
         sys.stdout.write(f"Version: {__version__}\n")
         return

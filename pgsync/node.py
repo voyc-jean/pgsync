@@ -1,6 +1,6 @@
 """PGSync Node class representation."""
 import re
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import sqlalchemy as sa
 from six import string_types
@@ -45,7 +45,7 @@ class ForeignKey(object):
             set(RELATIONSHIP_FOREIGN_KEYS)
         ):
             raise RelationshipForeignKeyError(
-                "Relationship ForeignKey must contain a parent and child."
+                "ForeignKey Relationship must contain a parent and child."
             )
         self.parent = foreign_key.get("parent")
         self.child = foreign_key.get("child")
@@ -125,8 +125,8 @@ class Node(object):
         ]
         if not self.column_names:
             self.column_names = [str(column) for column in self.table_columns]
-            self.column_names.remove("xmin")
-            self.column_names.remove("oid")
+            for name in ("ctid", "oid", "xmin"):
+                self.column_names.remove(name)
 
         if self.label is None:
             self.label = self.table
@@ -142,7 +142,7 @@ class Node(object):
                 )
 
             if tokens:
-                tokenized = getattr(self.model.c, tokens[0])
+                tokenized = self.model.c[tokens[0]]
                 for token in tokens[1:]:
                     if token in JSONB_OPERATORS:
                         tokenized = tokenized.op(token)
@@ -163,12 +163,12 @@ class Node(object):
                         f'table "{self.table}"'
                     )
                 self.columns.append(column_name)
-                self.columns.append(getattr(self.model.c, column_name))
+                self.columns.append(self.model.c[column_name])
 
         self.relationship = Relationship(kwargs.get("relationship"))
         self._subquery = None
-        self._filters = []
-        self._mapping = {}
+        self._filters: list = []
+        self._mapping: dict = {}
 
     def __str__(self):
         return f"node: {self.schema}.{self.table}"
@@ -179,26 +179,26 @@ class Node(object):
     @property
     def primary_keys(self):
         return [
-            getattr(self.model.c, str(sa.text(primary_key)))
+            self.model.c[str(sa.text(primary_key))]
             for primary_key in self.model.primary_keys
         ]
 
     @property
-    def is_root(self):
+    def is_root(self) -> bool:
         return self.parent is None
 
     @property
-    def name(self):
+    def name(self) -> str:
         """
         returns a fully qualified node name
         """
         return f"{self.schema}.{self.table}"
 
-    def add_child(self, node):
+    def add_child(self, node: "Node") -> None:
         """
         all nodes except the root node must have a relationship defined
         """
-        node.parent = self
+        node.parent: Node = self
         if not node.is_root and (
             not node.relationship.type or not node.relationship.variant
         ):
@@ -207,7 +207,7 @@ class Node(object):
             )
         self.children.append(node)
 
-    def display(self, prefix: str = "", leaf: bool = True):
+    def display(self, prefix: str = "", leaf: bool = True) -> None:
         print(
             prefix, " - " if leaf else "|- ", self.table, sep=""
         )  # noqa T001
@@ -217,8 +217,8 @@ class Node(object):
             child.display(prefix, leaf)
 
 
-def traverse_breadth_first(root):
-    stack = [root]
+def traverse_breadth_first(root: Node) -> Node:
+    stack: List[Node] = [root]
     while stack:
         node = stack.pop(0)
         yield node
@@ -226,7 +226,7 @@ def traverse_breadth_first(root):
             stack.append(child)
 
 
-def traverse_post_order(root):
+def traverse_post_order(root: Node) -> Node:
     for child in root.children:
         yield from traverse_post_order(child)
     yield root
@@ -235,8 +235,8 @@ def traverse_post_order(root):
 class Tree(object):
     def __init__(self, base, **kwargs):
         self.base = base
-        self.nodes = set()
-        self.through_nodes = set()
+        self.nodes: Set = set()
+        self.through_nodes: Set = set()
 
     def build(self, root: dict) -> Node:
 

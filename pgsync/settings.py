@@ -25,6 +25,9 @@ REPLICATION_SLOT_CLEANUP_INTERVAL = env.float(
 CHECKPOINT_PATH = env.str("CHECKPOINT_PATH", default="./")
 # stdout log interval (in secs)
 LOG_INTERVAL = env.float("LOG_INTERVAL", default=0.5)
+# page block size
+BLOCK_SIZE = env.int("BLOCK_SIZE", default=2048 * 10)
+QUERY_LITERAL_BINDS = env.bool("QUERY_LITERAL_BINDS", default=None)
 
 # Elasticsearch:
 ELASTICSEARCH_SCHEME = env.str("ELASTICSEARCH_SCHEME", default="http")
@@ -103,7 +106,9 @@ REDIS_PORT = env.int("REDIS_PORT", default=6379)
 REDIS_DB = env.int("REDIS_DB", default=0)
 REDIS_AUTH = env.str("REDIS_AUTH", default=None)
 # number of items to read from Redis at a time
-REDIS_CHUNK_SIZE = env.int("REDIS_CHUNK_SIZE", default=1000)
+REDIS_READ_CHUNK_SIZE = env.int("REDIS_READ_CHUNK_SIZE", default=1000)
+# number of items to write to Redis at a time
+REDIS_WRITE_CHUNK_SIZE = env.int("REDIS_WRITE_CHUNK_SIZE", default=1000)
 # redis socket connection timeout
 REDIS_SOCKET_TIMEOUT = env.int("REDIS_SOCKET_TIMEOUT", default=5)
 # redis poll interval (in secs)

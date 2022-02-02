@@ -29,7 +29,12 @@ from .exc import (
     TableNotFoundError,
 )
 from .node import Node
-from .settings import PG_SSLMODE, PG_SSLROOTCERT, QUERY_CHUNK_SIZE
+from .settings import (
+    PG_SSLMODE,
+    PG_SSLROOTCERT,
+    QUERY_CHUNK_SIZE,
+    QUERY_LITERAL_BINDS,
+)
 from .trigger import CREATE_TRIGGER_TEMPLATE
 from .urls import get_postgres_url
 from .view import create_view, drop_view
@@ -46,6 +51,25 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+class TupleIdentifierType(sa.types.UserDefinedType):
+    cache_ok: bool = True
+
+    def get_col_spec(self, **kw) -> str:
+        return "TID"
+
+    def bind_processor(self, dialect):
+        def process(value):
+            return value
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            return value
+
+        return process
 
 
 class Base(object):
@@ -92,6 +116,13 @@ class Base(object):
                 f"Invalid user permission {permissions}"
             )
 
+        # Azure usernames are of the form username@host on the SQLAlchemy
+        # engine - engine.url.username@host but stored in
+        # pg_user as just user.
+        # we need to extract the real username from: username@host.
+        host_part: str = self.engine.url.host.split(".")[0]
+        username: str = username.split(f"@{host_part}")[0]
+
         with self.__engine.connect() as conn:
             return (
                 conn.execute(
@@ -117,7 +148,7 @@ class Base(object):
             )
 
     # Tables...
-    def model(self, table: str, schema: str):
+    def model(self, table: str, schema: str) -> dict:
         """Get an SQLAlchemy model representation from a table.
 
         Args:
@@ -141,6 +172,7 @@ class Base(object):
                 )
             model = metadata.tables[name]
             model.append_column(sa.Column("xmin", sa.BigInteger))
+            model.append_column(sa.Column("ctid"), TupleIdentifierType)
             # support SQLQlchemy/Postgres 14 which somehow now reflects
             # the oid column
             if "oid" not in [column.name for column in model.columns]:
@@ -390,7 +422,9 @@ class Base(object):
         )
 
     # Views...
-    def _primary_keys(self, schema: str, tables: List[str]):
+    def _primary_keys(
+        self, schema: str, tables: List[str]
+    ) -> sa.sql.selectable.Select:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=sa.exc.SAWarning)
             pg_class = self.model("pg_class", "pg_catalog")
@@ -475,7 +509,9 @@ class Base(object):
             .group_by(pg_index.c.indrelid)
         )
 
-    def _foreign_keys(self, schema: str, tables: List[str]):
+    def _foreign_keys(
+        self, schema: str, tables: List[str]
+    ) -> sa.sql.selectable.Select:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=sa.exc.SAWarning)
             table_constraints = self.model(
@@ -711,12 +747,13 @@ class Base(object):
         payload.update(match.groupdict())
         span = match.span()
         # trailing space is deliberate
-        suffix = f"{row[span[1]:]} "
+        suffix: str = f"{row[span[1]:]} "
+        tg_op: str = payload["tg_op"]
 
         if "old-key" and "new-tuple" in suffix:
             # this can only be an UPDATE operation
-            if payload["tg_op"] != UPDATE:
-                msg = f"Unknown {payload['tg_op']} operation for row: {row}"
+            if tg_op != UPDATE:
+                msg = f"Unknown {tg_op} operation for row: {row}"
                 raise LogicalSlotParseError(msg)
 
             i = suffix.index("old-key:")
@@ -733,9 +770,9 @@ class Base(object):
                     payload["new"][key] = value
         else:
             # this can be an INSERT, DELETE, UPDATE or TRUNCATE operation
-            if payload["tg_op"] not in TG_OP:
-                msg = f"Unknown {payload['tg_op']} operation for row: {row}"
-                raise LogicalSlotParseError(msg)
+            if tg_op not in TG_OP:
+                message = f"Unknown {tg_op} operation for row: {row}"
+                raise LogicalSlotParseError(message)
 
             for key, value in _parse_logical_slot(suffix):
                 payload["new"][key] = value
@@ -784,8 +821,12 @@ class Base(object):
             raise
         return rows
 
-    def fetchmany(self, statement, chunk_size=None):
-        chunk_size = chunk_size or QUERY_CHUNK_SIZE
+    def fetchmany(
+        self,
+        statement: sa.sql.selectable.Select,
+        chunk_size: Optional[int] = None,
+    ):
+        chunk_size: int = chunk_size or QUERY_CHUNK_SIZE
         with self.__engine.connect() as conn:
             result = conn.execution_options(stream_results=True).execute(
                 statement.select()
@@ -849,8 +890,7 @@ def _get_foreign_keys(model_a, model_b) -> dict:
     if not foreign_keys:
         raise ForeignKeyError(
             f"No foreign key relationship between "
-            f'"{model_a.original}" and '
-            f'"{model_b.original}"'
+            f'"{model_a.original}" and "{model_b.original}"'
         )
 
     return foreign_keys
@@ -998,6 +1038,11 @@ def compiled_query(
     query: str, label: Optional[str] = None, literal_binds: bool = False
 ) -> None:
     """Compile an SQLAlchemy query with an optional label."""
+
+    # overide env value of literal_binds
+    if QUERY_LITERAL_BINDS:
+        literal_binds = QUERY_LITERAL_BINDS
+
     query: str = str(
         query.compile(
             dialect=sa.dialects.postgresql.dialect(),
@@ -1007,7 +1052,9 @@ def compiled_query(
     query: str = sqlparse.format(query, reindent=True, keyword_case="upper")
     if label:
         logger.debug(f"\033[4m{label}:\033[0m\n{query}")
-        sys.stdout.write(f"\033[4m{label}:\033[0m\n{query}")
+        sys.stdout.write(f"\033[4m{label}:\033[0m\n{query}\n")
     else:
         logging.debug(f"{query}")
-        sys.stdout.write(f"{query}")
+        sys.stdout.write(f"{query}\n")
+    sys.stdout.write("-" * 79)
+    sys.stdout.write("\n")
