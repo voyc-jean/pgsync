@@ -1,6 +1,5 @@
 """PGSync views."""
 import logging
-from typing import List
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import array
@@ -38,7 +37,7 @@ def compile_create_view(
         element.selectable,
         literal_binds=True,
     )
-    materialized: bool = "MATERIALIZED" if element.materialized else ""
+    materialized: str = "MATERIALIZED" if element.materialized else ""
     return (
         f'CREATE {materialized} VIEW "{element.schema}"."{element.name}" AS '
         f"{statement}"
@@ -61,10 +60,10 @@ class DropView(DDLElement):
 
 @compiler.compiles(DropView)
 def compile_drop_view(
-    element: CreateView, compiler: PGDDLCompiler, **kwargs
+    element: DropView, compiler: PGDDLCompiler, **kwargs
 ) -> str:
-    materialized: bool = "MATERIALIZED" if element.materialized else ""
-    cascade: bool = "CASCADE" if element.cascade else ""
+    cascade: str = "CASCADE" if element.cascade else ""
+    materialized: str = "MATERIALIZED" if element.materialized else ""
     return (
         f"DROP {materialized} VIEW IF EXISTS "
         f'"{element.schema}"."{element.name}" {cascade}'
@@ -72,16 +71,16 @@ def compile_drop_view(
 
 
 class CreateIndex(DDLElement):
-    def __init__(self, name: str, schema: str, view: str, columns: List):
+    def __init__(self, name: str, schema: str, view: str, columns: list):
         self.schema: str = schema
         self.name: str = name
         self.view: str = view
-        self.columns: List = columns
+        self.columns: list = columns
 
 
 @compiler.compiles(CreateIndex)
 def compile_create_index(
-    element: CreateView, compiler: PGDDLCompiler, **kwargs
+    element: CreateIndex, compiler: PGDDLCompiler, **kwargs
 ) -> str:
     return (
         f"CREATE UNIQUE INDEX {element.name} ON "
@@ -96,7 +95,7 @@ class DropIndex(DDLElement):
 
 @compiler.compiles(DropIndex)
 def compile_drop_index(
-    element: CreateView, compiler: PGDDLCompiler, **kwargs
+    element: DropIndex, compiler: PGDDLCompiler, **kwargs
 ) -> str:
     return f"DROP INDEX IF EXISTS {element.name}"
 
@@ -107,7 +106,7 @@ def create_view(
     tables: list,
     user_defined_fkey_tables: dict,
     base: "Base",  # noqa F821
-):
+) -> None:
     """
     View describing primary_keys and foreign_keys for each table
     with an index on table_name
@@ -219,7 +218,7 @@ def create_view(
     logger.debug(f"Created view: {schema}.{MATERIALIZED_VIEW}")
 
 
-def drop_view(engine, schema: str):
+def drop_view(engine, schema: str) -> None:
     logger.debug(f"Dropping view: {schema}.{MATERIALIZED_VIEW}")
     engine.execute(DropView(schema, MATERIALIZED_VIEW))
     logger.debug(f"Dropped view: {schema}.{MATERIALIZED_VIEW}")

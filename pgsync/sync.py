@@ -8,6 +8,7 @@ import pprint
 import re
 import select
 import sys
+import threading
 import time
 from collections import defaultdict
 from typing import AnyStr, Generator, List, Optional, Set
@@ -57,7 +58,7 @@ from .settings import (
     REPLICATION_SLOT_CLEANUP_INTERVAL,
 )
 from .transform import get_private_keys, transform
-from .utils import get_config, show_settings, threaded, Timer
+from .utils import exit_handler, get_config, show_settings, threaded, Timer
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +283,7 @@ class Sync(Base):
         except OSError:
             pass
 
-        self.redis._delete()
+        self.redis.delete()
 
         for schema in self.schemas:
             tables: Set = set([])
@@ -634,7 +635,7 @@ class Sync(Base):
                 )
                 fields = defaultdict(list)
 
-                _filters = []
+                _filters: list = []
                 for key, value in primary_fields.items():
                     fields[key].append(value)
 
@@ -918,6 +919,7 @@ class Sync(Base):
                 bar.update(1)
 
                 row: dict = transform(row, self.nodes)
+
                 row[META] = get_private_keys(keys)
                 if extra:
                     if extra["table"] not in row[META]:
@@ -946,6 +948,8 @@ class Sync(Base):
 
                 if self._plugins:
                     doc = next(self._plugins.transform([doc]))
+                    if not doc:
+                        continue
 
                 if self.pipeline:
                     doc["pipeline"] = self.pipeline
@@ -969,6 +973,7 @@ class Sync(Base):
         self._checkpoint: int = value
 
     @threaded
+    @exit_handler
     def poll_redis(self) -> None:
         """Consumer which polls Redis continuously."""
         while True:
@@ -980,6 +985,7 @@ class Sync(Base):
             time.sleep(REDIS_POLL_INTERVAL)
 
     @threaded
+    @exit_handler
     def poll_db(self) -> None:
         """
         Producer which polls Postgres continuously.
@@ -1079,6 +1085,7 @@ class Sync(Base):
         self._truncate: bool = True
 
     @threaded
+    @exit_handler
     def truncate_slots(self) -> None:
         """Truncate the logical replication slot."""
         while True:
@@ -1088,6 +1095,7 @@ class Sync(Base):
             time.sleep(REPLICATION_SLOT_CLEANUP_INTERVAL)
 
     @threaded
+    @exit_handler
     def status(self):
         while True:
             sys.stdout.write(

@@ -74,11 +74,7 @@ class TupleIdentifierType(sa.types.UserDefinedType):
 
 class Base(object):
     def __init__(self, database: str, verbose: bool = False, *args, **kwargs):
-        """Initialize the base class constructor.
-
-        Args:
-            database: The database name
-        """
+        """Initialize the base class constructor."""
         self.__engine = pg_engine(database, **kwargs)
         self.__schemas: Optional[dict] = None
         # models is a dict of f'{schema}.{table}'
@@ -981,7 +977,12 @@ def pg_engine(
     return sa.create_engine(url, echo=echo, connect_args=connect_args)
 
 
-def pg_execute(engine, query, values=None, options=None) -> None:
+def pg_execute(
+    engine,
+    query,
+    values: Optional[list] = None,
+    options: Optional[dict] = None,
+) -> None:
     options: dict = options or {"isolation_level": "AUTOCOMMIT"}
     conn = engine.connect()
     try:
