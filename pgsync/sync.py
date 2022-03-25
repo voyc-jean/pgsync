@@ -8,7 +8,6 @@ import pprint
 import re
 import select
 import sys
-import threading
 import time
 from collections import defaultdict
 from typing import AnyStr, Generator, List, Optional, Set
@@ -38,20 +37,15 @@ from .exc import (
     SchemaError,
     SuperUserError,
 )
-from .node import (
-    get_node,
-    Node,
-    node_from_table,
-    traverse_breadth_first,
-    traverse_post_order,
-    Tree,
-)
+from .node import get_node, Node, node_from_table, Tree
 from .plugin import Plugins
 from .querybuilder import QueryBuilder
 from .redisqueue import RedisQueue
 from .settings import (
     CHECKPOINT_PATH,
     LOG_INTERVAL,
+    NTHREADS_POLLDB,
+    PG_LOGICAL_SLOT_UPTO_NCHANGES,
     POLL_TIMEOUT,
     REDIS_POLL_INTERVAL,
     REDIS_WRITE_CHUNK_SIZE,
@@ -127,13 +121,13 @@ class Sync(Base):
         except TypeError:
             raise RuntimeError(
                 "Ensure there is at least one replication slot defined "
-                "by setting max_replication_slots=1"
+                "by setting max_replication_slots = 1"
             )
 
         wal_level: Optional[str] = self.pg_settings("wal_level")
         if not wal_level or wal_level.lower() != "logical":
             raise RuntimeError(
-                "Enable logical decoding by setting wal_level=logical"
+                "Enable logical decoding by setting wal_level = logical"
             )
 
         rds_logical_replication: Optional[str] = self.pg_settings(
@@ -170,17 +164,23 @@ class Sync(Base):
         if not os.path.exists(CHECKPOINT_PATH):
             raise RuntimeError(
                 f'Ensure the checkpoint directory exists "{CHECKPOINT_PATH}" '
-                f"and is readable ."
+                f"and is readable."
+            )
+
+        if not os.access(CHECKPOINT_PATH, os.W_OK | os.R_OK):
+            raise RuntimeError(
+                f'Ensure the checkpoint directory "{CHECKPOINT_PATH}" is '
+                f"read/writable"
             )
 
         root: Node = self.tree.build(self.nodes)
         root.display()
-        for node in traverse_breadth_first(root):
+        for node in root.traverse_breadth_first():
             pass
 
     def analyze(self) -> None:
         root: Node = self.tree.build(self.nodes)
-        for node in traverse_breadth_first(root):
+        for node in root.traverse_breadth_first():
 
             if node.is_root:
                 continue
@@ -196,12 +196,12 @@ class Sync(Base):
                     through_table,
                     node.schema,
                 )
-                foreign_keys = get_foreign_keys(
+                foreign_keys: dict = get_foreign_keys(
                     node.parent,
                     through,
                 )
             else:
-                foreign_keys = get_foreign_keys(
+                foreign_keys: dict = get_foreign_keys(
                     node.parent,
                     node,
                 )
@@ -254,7 +254,7 @@ class Sync(Base):
             user_defined_fkey_tables: dict = {}
 
             root: Node = self.tree.build(self.nodes)
-            for node in traverse_breadth_first(root):
+            for node in root.traverse_breadth_first():
                 if node.schema != schema:
                     continue
                 tables |= set(node.relationship.through_tables)
@@ -288,7 +288,7 @@ class Sync(Base):
         for schema in self.schemas:
             tables: Set = set([])
             root: Node = self.tree.build(self.nodes)
-            for node in traverse_breadth_first(root):
+            for node in root.traverse_breadth_first():
                 tables |= set(node.relationship.through_tables)
                 tables |= set([node.table])
             self.drop_triggers(schema=schema, tables=tables)
@@ -330,64 +330,70 @@ class Sync(Base):
         TODO: We can also process all INSERTS together and rearrange
         them as done below
         """
-        rows: list = self.logical_slot_peek_changes(
+        # minimize the tmp file disk usage when calling
+        # PG_LOGICAL_SLOT_PEEK_CHANGES and PG_LOGICAL_SLOT_GET_CHANGES
+        # by limiting to a smaller batch size.
+        upto_nchanges: int = PG_LOGICAL_SLOT_UPTO_NCHANGES
+        changes: list = self.logical_slot_peek_changes(
             self.__name,
             txmin=txmin,
             txmax=txmax,
-            upto_nchanges=None,
+            upto_nchanges=upto_nchanges,
         )
 
-        rows: list = rows or []
-        payloads: list = []
-        _rows: list = []
+        while changes:
+            rows: list = []
+            for row in changes:
+                if re.search(r"^BEGIN", row.data) or re.search(
+                    r"^COMMIT", row.data
+                ):
+                    continue
+                rows.append(row)
 
-        for row in rows:
-            if re.search(r"^BEGIN", row.data) or re.search(
-                r"^COMMIT", row.data
-            ):
-                continue
-            _rows.append(row)
-
-        for i, row in enumerate(_rows):
-
-            logger.debug(f"txid: {row.xid}")
-            logger.debug(f"data: {row.data}")
-            # TODO: optimize this so we are not parsing the same row twice
-            try:
-                payload = self.parse_logical_slot(row.data)
-            except Exception as e:
-                logger.exception(
-                    f"Error parsing row: {e}\nRow data: {row.data}"
-                )
-                raise
-            payloads.append(payload)
-
-            j: int = i + 1
-            if j < len(_rows):
+            payloads: list = []
+            for i, row in enumerate(rows):
+                logger.debug(f"txid: {row.xid}")
+                logger.debug(f"data: {row.data}")
+                # TODO: optimize this so we are not parsing the same row twice
                 try:
-                    payload2 = self.parse_logical_slot(_rows[j].data)
+                    payload = self.parse_logical_slot(row.data)
                 except Exception as e:
                     logger.exception(
-                        f"Error parsing row: {e}\nRow data: {_rows[j].data}"
+                        f"Error parsing row: {e}\nRow data: {row.data}"
                     )
                     raise
+                payloads.append(payload)
 
-                if (
-                    payload["tg_op"] != payload2["tg_op"]
-                    or payload["table"] != payload2["table"]
-                ):
+                j: int = i + 1
+                if j < len(rows):
+                    try:
+                        payload2 = self.parse_logical_slot(rows[j].data)
+                    except Exception as e:
+                        logger.exception(
+                            f"Error parsing row: {e}\nRow data: {rows[j].data}"
+                        )
+                        raise
+
+                    if (
+                        payload["tg_op"] != payload2["tg_op"]
+                        or payload["table"] != payload2["table"]
+                    ):
+                        self.es.bulk(self.index, self._payloads(payloads))
+                        payloads: list = []
+                elif j == len(rows):
                     self.es.bulk(self.index, self._payloads(payloads))
                     payloads: list = []
-            elif j == len(_rows):
-                self.es.bulk(self.index, self._payloads(payloads))
-                payloads: list = []
-
-        if rows:
             self.logical_slot_get_changes(
                 self.__name,
                 txmin=txmin,
                 txmax=txmax,
-                upto_nchanges=len(rows),
+                upto_nchanges=upto_nchanges,
+            )
+            changes: list = self.logical_slot_peek_changes(
+                self.__name,
+                txmin=txmin,
+                txmax=txmax,
+                upto_nchanges=upto_nchanges,
             )
             self.count["xlog"] += len(rows)
 
@@ -512,7 +518,7 @@ class Sync(Base):
                     }
                     if self.routing:
                         doc["_routing"] = old_values[self.routing]
-                    if self.es.major_version < 7 and not self.es.opensearch:
+                    if self.es.major_version < 7 and not self.es.is_opensearch:
                         doc["_type"] = "_doc"
                     docs.append(doc)
 
@@ -614,7 +620,7 @@ class Sync(Base):
                 }
                 if self.routing:
                     doc["_routing"] = payload_data[self.routing]
-                if self.es.major_version < 7 and not self.es.opensearch:
+                if self.es.major_version < 7 and not self.es.is_opensearch:
                     doc["_type"] = "_doc"
                 docs.append(doc)
             if docs:
@@ -663,7 +669,7 @@ class Sync(Base):
                     "_index": self.index,
                     "_op_type": "delete",
                 }
-                if self.es.major_version < 7 and not self.es.opensearch:
+                if self.es.major_version < 7 and not self.es.is_opensearch:
                     doc["_type"] = "_doc"
                 docs.append(doc)
             if docs:
@@ -829,7 +835,7 @@ class Sync(Base):
 
         self.query_builder.isouter: bool = True
 
-        for node in traverse_post_order(root):
+        for node in root.traverse_post_order():
 
             self._build_filters(filters, node)
 
@@ -943,7 +949,7 @@ class Sync(Base):
                 if self.routing:
                     doc["_routing"] = row[self.routing]
 
-                if self.es.major_version < 7 and not self.es.opensearch:
+                if self.es.major_version < 7 and not self.es.is_opensearch:
                     doc["_type"] = "_doc"
 
                 if self._plugins:
@@ -1079,9 +1085,9 @@ class Sync(Base):
         logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
         # forward pass sync
         self.es.bulk(self.index, self.sync(txmin=txmin, txmax=txmax))
-        self.checkpoint: int = txmax or self.txid_current
         # now sync up to txmax to capture everything we may have missed
         self.logical_slot_changes(txmin=txmin, txmax=txmax)
+        self.checkpoint: int = txmax or self.txid_current
         self._truncate: bool = True
 
     @threaded
@@ -1109,7 +1115,7 @@ class Sync(Base):
             sys.stdout.flush()
             time.sleep(LOG_INTERVAL)
 
-    def receive(self) -> None:
+    def receive(self, nthreads_polldb=None) -> None:
         """
         Receive events from db.
 
@@ -1121,7 +1127,9 @@ class Sync(Base):
         """
         # start a background worker producer thread to poll the db and populate
         # the Redis cache
-        self.poll_db()
+        nthreads_polldb = nthreads_polldb or NTHREADS_POLLDB
+        for _ in range(nthreads_polldb):
+            self.poll_db()
 
         # sync up to current transaction_id
         self.pull()
@@ -1189,6 +1197,13 @@ class Sync(Base):
     default=False,
     help="Analyse database",
 )
+@click.option(
+    "--nthreads_polldb",
+    "-n",
+    help="Number of threads to spawn for poll db",
+    type=int,
+    default=NTHREADS_POLLDB,
+)
 def main(
     config,
     daemon,
@@ -1201,6 +1216,7 @@ def main(
     verbose,
     version,
     analyze,
+    nthreads_polldb,
 ):
     """Main application syncer."""
     if version:
@@ -1226,20 +1242,20 @@ def main(
 
     config: str = get_config(config)
 
-    show_settings(config, **kwargs)
+    show_settings(config)
 
     if analyze:
         for document in json.load(open(config)):
-            sync = Sync(document, verbose=verbose, **kwargs)
+            sync: Sync = Sync(document, verbose=verbose, **kwargs)
             sync.analyze()
         return
 
     with Timer():
         for document in json.load(open(config)):
-            sync = Sync(document, verbose=verbose, **kwargs)
+            sync: Sync = Sync(document, verbose=verbose, **kwargs)
             sync.pull()
             if daemon:
-                sync.receive()
+                sync.receive(nthreads_polldb)
 
 
 if __name__ == "__main__":

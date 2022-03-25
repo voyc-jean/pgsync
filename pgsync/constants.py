@@ -100,6 +100,7 @@ ELASTICSEARCH_TYPES = [
     "interval_year_to_month",
     "ip",
     "keyword",
+    "knn_vector",
     "long",
     "long_range",
     "nested",
@@ -145,6 +146,7 @@ ELASTICSEARCH_MAPPING_PARAMETERS = [
     "term_vector",
 ]
 
+ELASTICSEARCH_TAGLINE = "You Know, for Search"
 
 CONCAT_TRANSFORM = "concat"
 MAPPING_TRANSFORM = "mapping"
@@ -161,7 +163,7 @@ TRANSFORM_TYPES = [
 ]
 
 # default postgres schema
-SCHEMA = "public"
+DEFAULT_SCHEMA = "public"
 
 BUILTIN_SCHEMAS = ["information_schema"]
 

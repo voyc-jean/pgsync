@@ -11,10 +11,11 @@ from requests_aws4auth import AWS4Auth
 
 from .constants import (
     ELASTICSEARCH_MAPPING_PARAMETERS,
+    ELASTICSEARCH_TAGLINE,
     ELASTICSEARCH_TYPES,
     META,
 )
-from .node import Node, traverse_post_order
+from .node import Node
 from .settings import (
     ELASTICSEARCH_API_KEY,
     ELASTICSEARCH_API_KEY_ID,
@@ -55,13 +56,13 @@ class ElasticHelper(object):
         """
         url: str = get_elasticsearch_url()
         self.__es: Elasticsearch = get_elasticsearch_client(url)
-        self.opensearch: bool = False
+        self.is_opensearch: bool = False
         try:
             self.major_version: int = int(
                 self.__es.info()["version"]["number"].split(".")[0]
             )
-            self.opensearch = (
-                self.__es.info()["tagline"] != "You Know, for Search"
+            self.is_opensearch = (
+                self.__es.info()["tagline"] != ELASTICSEARCH_TAGLINE
             )
         except (IndexError, KeyError, ValueError):
             self.major_version: int = 0
@@ -100,6 +101,20 @@ class ElasticHelper(object):
         raise_on_error: Optional[bool] = None,
     ) -> None:
         """Pull sync data from generator to Elasticsearch."""
+        chunk_size: int = chunk_size or ELASTICSEARCH_CHUNK_SIZE
+        max_chunk_bytes: int = max_chunk_bytes or ELASTICSEARCH_MAX_CHUNK_BYTES
+        thread_count: int = thread_count or ELASTICSEARCH_THREAD_COUNT
+        queue_size: int = queue_size or ELASTICSEARCH_QUEUE_SIZE
+        # max_retries, initial_backoff & max_backoff are only applicable when
+        # streaming bulk is in use
+        max_retries: int = max_retries or ELASTICSEARCH_MAX_RETRIES
+        initial_backoff: int = initial_backoff or ELASTICSEARCH_INITIAL_BACKOFF
+        max_backoff: int = max_backoff or ELASTICSEARCH_MAX_BACKOFF
+        raise_on_exception: bool = (
+            raise_on_exception or ELASTICSEARCH_RAISE_ON_EXCEPTION
+        )
+        raise_on_error: bool = raise_on_error or ELASTICSEARCH_RAISE_ON_ERROR
+
         try:
             self._bulk(
                 index,
@@ -117,37 +132,29 @@ class ElasticHelper(object):
             )
         except Exception as e:
             logger.exception(f"Exception {e}")
-            raise
+            if raise_on_exception or raise_on_error:
+                raise
 
     def _bulk(
         self,
         index: str,
         docs: Generator,
-        chunk_size: Optional[int] = None,
-        max_chunk_bytes: Optional[int] = None,
-        queue_size: Optional[int] = None,
-        thread_count: Optional[int] = None,
-        refresh: bool = False,
-        max_retries: Optional[int] = None,
-        initial_backoff: Optional[int] = None,
-        max_backoff: Optional[int] = None,
-        raise_on_exception: Optional[bool] = None,
-        raise_on_error: Optional[bool] = None,
+        chunk_size: int,
+        max_chunk_bytes: int,
+        queue_size: int,
+        thread_count: int,
+        refresh: bool,
+        max_retries: int,
+        initial_backoff: int,
+        max_backoff: int,
+        raise_on_exception: bool,
+        raise_on_error: bool,
     ):
         """Bulk index, update, delete docs to Elasticsearch."""
-        chunk_size: int = chunk_size or ELASTICSEARCH_CHUNK_SIZE
-        max_chunk_bytes: int = max_chunk_bytes or ELASTICSEARCH_MAX_CHUNK_BYTES
-        thread_count: int = thread_count or ELASTICSEARCH_THREAD_COUNT
-        queue_size: int = queue_size or ELASTICSEARCH_QUEUE_SIZE
-        # max_retries, initial_backoff & max_backoff are only applicable when
-        # streaming bulk is in use
-        max_retries: int = max_retries or ELASTICSEARCH_MAX_RETRIES
-        initial_backoff: int = initial_backoff or ELASTICSEARCH_INITIAL_BACKOFF
-        max_backoff: int = max_backoff or ELASTICSEARCH_MAX_BACKOFF
-        raise_on_exception: bool = (
-            raise_on_exception or ELASTICSEARCH_RAISE_ON_EXCEPTION
-        )
-        raise_on_error: bool = raise_on_error or ELASTICSEARCH_RAISE_ON_ERROR
+
+        # when using multiple threads for poll_db we need to account for other
+        # threads performing deletions
+        ignore_status: Tuple[int] = (400, 404)
 
         if ELASTICSEARCH_STREAMING_BULK:
             for _ in helpers.streaming_bulk(
@@ -177,6 +184,7 @@ class ElasticHelper(object):
                 refresh=refresh,
                 raise_on_exception=raise_on_exception,
                 raise_on_error=raise_on_error,
+                ignore_status=ignore_status,
             ):
                 self.doc_count += 1
 
@@ -261,7 +269,7 @@ class ElasticHelper(object):
 
     def _build_mapping(self, root: Node, routing: str) -> Optional[dict]:
         """Get the Elasticsearch mapping from the schema transform."""
-        for node in traverse_post_order(root):
+        for node in root.traverse_post_order():
 
             rename: dict = node.transform.get("rename", {})
             mapping: dict = node.transform.get("mapping", {})
@@ -307,7 +315,7 @@ class ElasticHelper(object):
             root._mapping["_routing"] = {"required": True}
 
         if root._mapping:
-            if self.major_version < 7 and not self.opensearch:
+            if self.major_version < 7 and not self.is_opensearch:
                 root._mapping = {"_doc": root._mapping}
 
             return dict(mappings=root._mapping)

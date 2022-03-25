@@ -19,6 +19,7 @@ FIELDS = {
     "copyright": "word",
     "tags": "words",
     "doc": "json",
+    "publish_date": "date_time",
 }
 
 
@@ -111,7 +112,7 @@ def delete_op(session: sessionmaker, model, nsize: int) -> None:
 
 
 def truncate_op(session: sessionmaker, model, nsize: int) -> None:
-    pass
+    raise NotImplementedError
 
 
 @click.command()

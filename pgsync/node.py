@@ -1,18 +1,21 @@
 """PGSync Node class representation."""
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
 from typing import List, Optional, Set
 
 import sqlalchemy as sa
 from six import string_types
 
 from .constants import (
+    DEFAULT_SCHEMA,
     JSONB_OPERATORS,
     NODE_ATTRIBUTES,
     RELATIONSHIP_ATTRIBUTES,
     RELATIONSHIP_FOREIGN_KEYS,
     RELATIONSHIP_TYPES,
     RELATIONSHIP_VARIANTS,
-    SCHEMA,
 )
 from .exc import (
     ColumnNotFoundError,
@@ -28,45 +31,45 @@ from .exc import (
 )
 
 
-def _safe_get(obj, attr):
-    value = obj.get(attr)
-    if value is not None:
-        value = value.lower()
-    return value
+@dataclass
+class ForeignKey:
+    foreign_key: Optional[dict] = None
 
-
-class ForeignKey(object):
-    def __init__(self, foreign_key: Optional[str] = None):
+    def __post_init__(self):
         """ForeignKey constructor."""
-        foreign_key: str = foreign_key or dict()
-        self.parent: str = foreign_key.get("parent")
-        self.child: str = foreign_key.get("child")
-        if not set(foreign_key.keys()).issubset(
+        self.foreign_key: str = self.foreign_key or dict()
+        self.parent: str = self.foreign_key.get("parent")
+        self.child: str = self.foreign_key.get("child")
+        if not set(self.foreign_key.keys()).issubset(
             set(RELATIONSHIP_FOREIGN_KEYS)
         ):
             raise RelationshipForeignKeyError(
                 "ForeignKey Relationship must contain a parent and child."
             )
-        self.parent = foreign_key.get("parent")
-        self.child = foreign_key.get("child")
+        self.parent = self.foreign_key.get("parent")
+        self.child = self.foreign_key.get("child")
 
     def __str__(self):
         return f"foreign_key: {self.parent}:{self.child}"
 
-    def __repr__(self):
-        return self.__str__()
 
+@dataclass
+class Relationship:
+    relationship: Optional[dict] = None
 
-class Relationship(object):
-    def __init__(self, relationship=None):
+    def __post_init__(self):
         """Relationship constructor."""
-        relationship: dict = relationship or dict()
-        self.type: str = relationship.get("type")
-        self.variant: str = relationship.get("variant")
-        self.through_tables: List = relationship.get("through_tables", [])
+        self.relationship: dict = self.relationship or dict()
+        self.type: str = self.relationship.get("type")
+        self.variant: str = self.relationship.get("variant")
+        self.through_tables: List[str] = self.relationship.get(
+            "through_tables", []
+        )
 
-        if not set(relationship.keys()).issubset(set(RELATIONSHIP_ATTRIBUTES)):
-            attrs = set(relationship.keys()).difference(
+        if not set(self.relationship.keys()).issubset(
+            set(RELATIONSHIP_ATTRIBUTES)
+        ):
+            attrs = set(self.relationship.keys()).difference(
                 set(RELATIONSHIP_ATTRIBUTES)
             )
             raise RelationshipAttributeError(
@@ -80,47 +83,48 @@ class Relationship(object):
             raise RelationshipVariantError(
                 f'Relationship variant "{self.variant}" is invalid.'
             )
-        if self.through_tables and len(self.through_tables) > 1:
+        if len(self.through_tables) > 1:
             raise MultipleThroughTablesError(
                 f"Multiple through tables: {self.through_tables}"
             )
-        self.type = _safe_get(relationship, "type")
-        self.variant = _safe_get(relationship, "variant")
-        self.through_tables = relationship.get("through_tables", [])
-        self.foreign_key = ForeignKey(relationship.get("foreign_key"))
+        if self.type:
+            self.type = self.type.lower()
+        if self.variant:
+            self.variant = self.variant.lower()
+        self.foreign_key: ForeignKey = ForeignKey(
+            self.relationship.get("foreign_key")
+        )
 
     def __str__(self):
         return (
             f"relationship: {self.variant}.{self.type}:{self.through_tables}"
         )
 
-    def __repr__(self):
-        return self.__str__()
 
-
+@dataclass
 class Node(object):
-    """Node class."""
 
-    def __init__(self, *args, **kwargs):  # noqa: C901
-        """Node constructor."""
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    model: sa.sql.selectable.Alias
+    table: str
+    schema: str
+    primary_key: Optional[list] = None
+    label: Optional[str] = None
+    transform: Optional[dict] = None
+    columns: Optional[list] = None
+    relationship: Optional[dict] = None
+    parent: Optional[Node] = None
 
-        if "parent" not in self.__dict__.keys():
-            self.parent = None
-
-        if "children" not in self.__dict__.keys():
-            self.children = []
-
-        self.table_columns = self.model.columns.keys()
-
+    def __post_init__(self):
+        self.columns = self.columns or []
+        self.children: List[Node] = []
+        self.table_columns: List[str] = self.model.columns.keys()
         if not self.model.primary_keys:
-            setattr(self.model, "primary_keys", kwargs.get("primary_key"))
+            setattr(self.model, "primary_keys", self.primary_key)
 
         # columns to fetch
-        self.column_names = [
+        self.column_names: List[str] = [
             column
-            for column in kwargs.get("columns", [])
+            for column in self.columns
             if isinstance(column, string_types)
         ]
         if not self.column_names:
@@ -165,16 +169,13 @@ class Node(object):
                 self.columns.append(column_name)
                 self.columns.append(self.model.c[column_name])
 
-        self.relationship = Relationship(kwargs.get("relationship"))
+        self.relationship: Relationship = Relationship(self.relationship)
         self._subquery = None
         self._filters: list = []
         self._mapping: dict = {}
 
     def __str__(self):
         return f"node: {self.schema}.{self.table}"
-
-    def __repr__(self):
-        return self.__str__()
 
     @property
     def primary_keys(self):
@@ -194,7 +195,7 @@ class Node(object):
         """
         return f"{self.schema}.{self.table}"
 
-    def add_child(self, node: "Node") -> None:
+    def add_child(self, node: Node) -> None:
         """
         all nodes except the root node must have a relationship defined
         """
@@ -216,35 +217,36 @@ class Node(object):
             leaf = i == (len(self.children) - 1)
             child.display(prefix, leaf)
 
+    def traverse_breadth_first(self) -> Node:
+        stack: List[Node] = [self]
+        while stack:
+            node: Node = stack.pop(0)
+            yield node
+            for child in node.children:
+                stack.append(child)
 
-def traverse_breadth_first(root: Node) -> Node:
-    stack: List[Node] = [root]
-    while stack:
-        node = stack.pop(0)
-        yield node
-        for child in node.children:
-            stack.append(child)
-
-
-def traverse_post_order(root: Node) -> Node:
-    for child in root.children:
-        yield from traverse_post_order(child)
-    yield root
+    def traverse_post_order(self) -> Node:
+        for child in self.children:
+            yield from child.traverse_post_order()
+        yield self
 
 
-class Tree(object):
-    def __init__(self, base, **kwargs):
-        self.base = base
-        self.nodes: Set = set()
-        self.through_nodes: Set = set()
+@dataclass
+class Tree:
+    base: "base.Base"
+
+    def __post_init__(self):
+        self.nodes: Set[str] = set()
+        self.through_nodes: Set[str] = set()
 
     def build(self, root: dict) -> Node:
 
         table: str = root.get("table")
-        schema: str = root.get("schema", SCHEMA)
+        schema: str = root.get("schema", DEFAULT_SCHEMA)
 
         if table is None:
             raise TableNotInNodeError(f"Table not specified in node: {root}")
+
         if schema and schema not in self.base.schemas:
             raise InvalidSchemaError(f"Unknown schema name(s): {schema}")
 
@@ -277,6 +279,7 @@ class Tree(object):
                 attrs = set(child.keys()).difference(set(NODE_ATTRIBUTES))
                 raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
             node.add_child(self.build(child))
+
         return node
 
 
@@ -294,7 +297,7 @@ def node_from_table(base, table: str, schema: str) -> Node:
 def get_node(tree, table: str, node_dict: dict) -> Node:
 
     root: Node = tree.build(node_dict)
-    for node in traverse_post_order(root):
+    for node in root.traverse_post_order():
         if table == node.table:
             return node
         elif table in node.relationship.through_tables:

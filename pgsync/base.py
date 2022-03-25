@@ -4,7 +4,7 @@ import os
 import sys
 import warnings
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sqlalchemy as sa
 import sqlparse
@@ -13,11 +13,11 @@ from sqlalchemy.orm import sessionmaker
 
 from .constants import (
     BUILTIN_SCHEMAS,
+    DEFAULT_SCHEMA,
     LOGICAL_SLOT_PREFIX,
     LOGICAL_SLOT_SUFFIX,
     MATERIALIZED_VIEW,
     PLUGIN,
-    SCHEMA,
     TG_OP,
     TRIGGER_FUNC,
     UPDATE,
@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 class TupleIdentifierType(sa.types.UserDefinedType):
     cache_ok: bool = True
 
-    def get_col_spec(self, **kw) -> str:
+    def get_col_spec(self, **kwargs) -> str:
         return "TID"
 
     def bind_processor(self, dialect):
@@ -78,7 +78,7 @@ class Base(object):
         self.__engine = pg_engine(database, **kwargs)
         self.__schemas: Optional[dict] = None
         # models is a dict of f'{schema}.{table}'
-        self.models: dict = {}
+        self.models: Dict[str] = {}
         self.__metadata: dict = {}
         self.__indices: dict = {}
         self.verbose: bool = verbose
@@ -229,14 +229,14 @@ class Base(object):
         return metadata.tables.keys()
 
     def _get_schema(self, schema: str, table: str) -> Tuple[str, str]:
-        pairs = table.split(".")
+        pairs: list = table.split(".")
         if len(pairs) == 2:
             return pairs[0], pairs[1]
         if len(pairs) == 1:
             return schema, pairs[0]
         raise ValueError(f"Invalid definition {table} for schema: {schema}")
 
-    def truncate_table(self, table: str, schema: str = SCHEMA) -> None:
+    def truncate_table(self, table: str, schema: str = DEFAULT_SCHEMA) -> None:
         """Truncate a table.
 
         Note:
@@ -255,7 +255,9 @@ class Base(object):
         query = f'TRUNCATE TABLE "{schema}"."{table}" CASCADE'
         self.execute(query)
 
-    def truncate_tables(self, tables: List[str], schema: str = SCHEMA) -> None:
+    def truncate_tables(
+        self, tables: List[str], schema: str = DEFAULT_SCHEMA
+    ) -> None:
         """Truncate all tables."""
         logger.debug(f"Truncating tables: {tables}")
         for table in tables:
@@ -340,8 +342,8 @@ class Base(object):
         txmax: Optional[int] = None,
         upto_lsn: Optional[int] = None,
         upto_nchanges: Optional[int] = None,
-    ):
-        filters: List = []
+    ) -> List[sa.engine.row.LegacyRow]:
+        filters: list = []
         statement: str = sa.select(
             [sa.column("xid"), sa.column("data")]
         ).select_from(
@@ -378,7 +380,7 @@ class Base(object):
         txmax: Optional[int] = None,
         upto_lsn: Optional[int] = None,
         upto_nchanges: Optional[int] = None,
-    ):
+    ) -> List[sa.engine.row.LegacyRow]:
         """Get/Consume changes from a logical replication slot.
 
         To get one change and data in existing replication slot:
@@ -403,7 +405,7 @@ class Base(object):
         txmax: Optional[int] = None,
         upto_lsn: Optional[int] = None,
         upto_nchanges: Optional[int] = None,
-    ):
+    ) -> List[sa.engine.row.LegacyRow]:
         """Peek a logical replication slot without consuming changes.
 
         SELECT * FROM PG_LOGICAL_SLOT_PEEK_CHANGES('testdb', NULL, 1)
@@ -429,7 +431,7 @@ class Base(object):
             pg_namespace = self.model("pg_namespace", "pg_catalog")
 
         alias = pg_class.alias("x")
-        inclause = []
+        inclause: list = []
         for table in tables:
             pairs = table.split(".")
             if len(pairs) == 1:
@@ -997,7 +999,7 @@ def pg_execute(
 
 def create_schema(engine, schema) -> None:
     """Create database schema."""
-    if schema != SCHEMA:
+    if schema != DEFAULT_SCHEMA:
         engine.execute(sa.schema.CreateSchema(schema))
 
 
